@@ -570,7 +570,7 @@ If your setup has camera offset from LiDAR, you need to:
 - **MeshLab** (free): https://www.meshlab.net/
 - **Open3D Viewer**: `python -c "import open3d as o3d; o3d.visualization.draw_geometries([o3d.io.read_point_cloud('file.ply')])"`
 
-### Meshes (`.ply`, `.obj`)
+### Meshes (`.ply`)
 - **Blender** (free, powerful): https://www.blender.org/
 - **MeshLab** (free): https://www.meshlab.net/
 - **Online viewer**: https://3dviewer.net/
