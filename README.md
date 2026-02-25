@@ -258,7 +258,7 @@ docker run --rm \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--camera_topic` | `None` | Camera topic (Image or CompressedImage) |
-| `--camera_info_topic` | None | Camera infor topic |
+| `--camera_info_topic` | `None` | Camera infor topic |
 | `--camera_fx` | `None` | Focal length x (pixels) |
 | `--camera_fy` | `None` | Focal length y (pixels) |
 | `--camera_cx` | `None` | Principal point x (pixels) |
