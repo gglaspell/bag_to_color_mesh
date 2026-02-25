@@ -2,6 +2,9 @@
 
 Convert ROS 2 bag files containing LiDAR point clouds and camera images into high-quality color 3D models with precision-tuned registration and drift correction.
 
+<img width="378" height="281" alt="Screenshot from 2026-02-11 17-51-17" src="https://github.com/user-attachments/assets/a4d13eb0-691d-4f5c-bd26-6905261f9116" />
+<img width="378" height="281" alt="Screenshot from 2026-02-11 18-02-10" src="https://github.com/user-attachments/assets/6dd92336-0500-42ec-930d-40f1bd15e371" />
+
 ---
 
 ## 🎨 What's New: Color Mesh Generation
