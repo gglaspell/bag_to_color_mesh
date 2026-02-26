@@ -261,13 +261,13 @@ docker run --rm \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--camera_topic` | `None` | Camera topic (Image or CompressedImage) |
-| `--camera_info_topic` | `None` | Camera infor topic |
+| `--camera_info_topic` | `None` | Camera info topic |
 | `--camera_fx` | `None` | Focal length x (pixels) |
 | `--camera_fy` | `None` | Focal length y (pixels) |
 | `--camera_cx` | `None` | Principal point x (pixels) |
 | `--camera_cy` | `None` | Principal point y (pixels) |
-| `--camera_width` | `640` | Image width (pixels) |
-| `--camera_height` | `480` | Image height (pixels) |
+| `--camera_width` | `None` | Image width (pixels) |
+| `--camera_height` | `None` | Image height (pixels) |
 | `--max_time_diff` | `0.1` | Max time diff (sec) for camera/lidar sync |
 
 ### Point Cloud & Odometry Parameters
