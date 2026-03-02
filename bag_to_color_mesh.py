@@ -479,7 +479,7 @@ def color_point_cloud_from_image(pcd: o3d.geometry.PointCloud, img: Image.Image,
     return pcd
 
 
-def merge_colored_point_clouds(colored_pcds, voxel_size: float = 0.02, gray_filter_radius: float = 0.05):
+def merge_colored_point_clouds(colored_pcds, voxel_size: float = 0.02, gray_filter_radius: float = 0.05, workers: int = 4):
     """
     Merge colored point clouds with smart gray filtering:
     - Gray points are kept ONLY if there are no colored points within `gray_filter_radius`.
@@ -536,7 +536,7 @@ def merge_colored_point_clouds(colored_pcds, voxel_size: float = 0.02, gray_filt
         gray_indices = np.where(merged_is_gray)[0]
         gray_pts = merged_pts[gray_indices]
 
-        neighbors = tree.query_ball_point(gray_pts, r=gray_filter_radius)
+        neighbors = tree.query_ball_point(gray_pts, r=gray_filter_radius, workers=workers)
         has_col_neighbor = np.array([len(n) > 0 for n in neighbors], dtype=bool)
 
         gray_to_remove = gray_indices[has_col_neighbor]
@@ -571,6 +571,7 @@ def create_colored_mesh(
     depth: int = 9,
     min_density_percentile: float = 1.0,
     max_vertex_distance: float = 0.15,
+    workers: int = 4,
 ):
     """
     Poisson reconstruction + trimming.
@@ -599,34 +600,100 @@ def create_colored_mesh(
     if densities.size > 0:
         thr = np.percentile(densities, float(min_density_percentile))
         logging.info(f"Density trim: bottom {min_density_percentile}% (threshold={thr:.4f})")
-        mesh.remove_vertices_by_mask(densities < thr)
 
-    if max_vertex_distance and float(max_vertex_distance) > 0:
-        logging.info(f"Distance trim: removing vertices farther than {max_vertex_distance}m from points...")
-        v = np.asarray(mesh.vertices)
-        p = np.asarray(pcd.points)
-        if len(v) > 0 and len(p) > 0:
-            tree = cKDTree(p)
-            d, _ = tree.query(v, k=1)
-            mesh.remove_vertices_by_mask(d > float(max_vertex_distance))
+        # It is crucial to convert densities mask to a clean boolean numpy array
+        density_mask = np.asarray(densities < thr, dtype=bool)
+        mesh.remove_vertices_by_mask(density_mask)
+
+    # Re-fetch points after potential mutations
+    p = np.asarray(pcd.points)
+    v = np.asarray(mesh.vertices)
+
+    if len(p) > 0 and len(v) > 0:
+        logging.info(f"Building spatial tree & querying nearest points (workers={workers})...")
+        tree = cKDTree(p)
+
+        logging.info(f"Querying {len(v)} vertices against {len(p)} points...")
+        # Use parallel workers to speed up the distance and index query
+        d, idx = tree.query(v, k=1, workers=workers)
+        logging.info("Spatial query complete.")
+
+        if max_vertex_distance and float(max_vertex_distance) > 0:
+            logging.info(f"Distance trim: calculating boolean mask for vertices farther than {max_vertex_distance}m...")
+
+            remove_mask = d > float(max_vertex_distance)
+            logging.info(f"Distance trim: removing {np.sum(remove_mask)} vertices out of {len(remove_mask)}...")
+
+            # Ensure bool array is properly cast and contiguous
+            remove_mask_bool = np.asarray(remove_mask, dtype=bool).copy()
+            mesh.remove_vertices_by_mask(remove_mask_bool)
+
+            logging.info("Distance trim: mask applied successfully.")
+
+            # Filter the queried indices to only the surviving vertices
+            valid_mask = ~remove_mask_bool
+            idx = idx[valid_mask]
+
+        # Delaying color mapping until the mesh is fully cleaned up and reduced...
+
+    # Cleanup
+    logging.info("Starting mesh cleanup sequence...")
+    logging.info("  1/6: Removing duplicated vertices...")
+    mesh.remove_duplicated_vertices()     # 1. merge coincident vertices first
+
+    logging.info("  2/6: Removing duplicated triangles...")
+    mesh.remove_duplicated_triangles()    # 2. now dedup triangles with merged indices
+
+    logging.info("  3/6: Removing degenerate triangles...")
+    mesh.remove_degenerate_triangles()    # 3. catch any zero-area triangles created above
+
+    logging.info("  4/6: Removing non-manifold edges...")
+    mesh.remove_non_manifold_edges()      # 4. remove fan edges after topology is clean
+
+    logging.info("  5/6: Removing degenerate triangles (second pass)...")
+    mesh.remove_degenerate_triangles()    # 5. second pass — non-manifold removal can expose new ones
+
+    logging.info("  6/6: Removing unreferenced vertices...")
+    mesh.remove_unreferenced_vertices()   # 6. always last
+    logging.info("Mesh cleanup sequence complete.")
+
+    # Extract largest connected component to ensure structural connectivity for navigation
+    logging.info("Extracting largest connected component...")
+    triangle_clusters, cluster_n_triangles, cluster_area = mesh.cluster_connected_triangles()
+    triangle_clusters = np.asarray(triangle_clusters)
+    cluster_n_triangles = np.asarray(cluster_n_triangles)
+    if len(cluster_n_triangles) > 0:
+        largest_cluster_idx = cluster_n_triangles.argmax()
+        triangles_to_remove = triangle_clusters != largest_cluster_idx
+        mesh.remove_triangles_by_mask(triangles_to_remove)
+        mesh.remove_unreferenced_vertices()
 
     # Ensure vertex colors exist if pcd has colors
     if pcd.has_colors() and not mesh.has_vertex_colors():
-        logging.info("Mesh has no vertex colors; painting from nearest point colors...")
-        p = np.asarray(pcd.points)
-        c = np.asarray(pcd.colors)
-        if len(p) > 0 and len(mesh.vertices) > 0:
-            tree = cKDTree(p)
-            v = np.asarray(mesh.vertices)
-            _, idx = tree.query(v, k=1)
-            mesh.vertex_colors = o3d.utility.Vector3dVector(c[idx])
+        logging.info("Painting colors onto the final, cleaned mesh structure...")
+        p_final = np.asarray(pcd.points)
+        c_final = np.asarray(pcd.colors)
+        v_final = np.asarray(mesh.vertices)
 
-    # Cleanup
-    mesh.remove_degenerate_triangles()
-    mesh.remove_duplicated_triangles()
-    mesh.remove_duplicated_vertices()
-    mesh.remove_non_manifold_edges()
-    mesh.remove_unreferenced_vertices()
+        if len(p_final) > 0 and len(v_final) > 0:
+            tree_final = cKDTree(p_final)
+            _, color_idx = tree_final.query(v_final, k=1, workers=workers)
+            mesh.vertex_colors = o3d.utility.Vector3dVector(c_final[color_idx])
+
+    # Validation checks
+    logging.info("Verifying mesh integrity...")
+    is_edge_manifold = mesh.is_edge_manifold(allow_boundary_edges=True)
+    is_vertex_manifold = mesh.is_vertex_manifold()
+
+    # logging.info("Testing for self-intersections (this may take a moment)...")
+    # has_self_intersections = mesh.is_self_intersecting()
+
+    logging.info(f"  - Edge Manifold: {is_edge_manifold}")
+    logging.info(f"  - Vertex Manifold: {is_vertex_manifold}")
+    # logging.info(f"  - Self-Intersecting: {has_self_intersections}")
+
+    # if has_self_intersections:
+        # logging.warning("Mesh has self-intersections. This can confuse collision detection systems.")
 
     logging.info(f"Final mesh: {len(mesh.vertices)} vertices, {len(mesh.triangles)} faces")
     return mesh
@@ -1039,6 +1106,7 @@ def process_bag(args):
         depth=int(args.poisson_depth),
         min_density_percentile=float(args.min_density_percentile),
         max_vertex_distance=float(args.max_vertex_distance),
+        workers=args.workers,
     )
 
     mesh_ply_path = out_dir / f"{bag_path.stem}_mesh.ply"
@@ -1090,11 +1158,12 @@ def main():
     p.add_argument("--maxvertexdistance", "--max_vertex_distance", dest="max_vertex_distance", type=float, default=0.15, help="Trim mesh vertices farther than this from points (m).")
 
     # Other
+        # Other
     p.add_argument("--levelfloor", "--level_floor", dest="level_floor", action="store_true", help="Attempt floor leveling.")
+    p.add_argument("--workers", type=int, default=4, help="Number of threads/workers.")
 
     args = p.parse_args()
     process_bag(args)
 
 if __name__ == "__main__":
     main()
-
