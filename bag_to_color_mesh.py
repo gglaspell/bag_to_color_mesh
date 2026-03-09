@@ -20,12 +20,28 @@ Added (from bag_to_mesh.py):
    - Statistical outlier removal (SOR)
    - DBSCAN clustering (keep largest component)
 
+Robust improvements (from robust-4.md):
+   - O(log N) timestamp lookup via bisect
+   - Odometry staleness guard (--odom_max_latency)
+   - Empty mesh guard after density trim
+   - Conditional loop closure memory allocation
+   - RANSAC uses PointToPoint (coarse alignment does not need normals)
+   - Deepcopy of loop closure candidates before ICP mutation
+   - Warning when odom topic yields no data
+   - Parameterized --poisson_depth and --min_density_percentile
+
+3) Mesh decimation (--decimate_target):
+   - Values <= 1.0 are treated as a ratio of the current triangle count.
+   - Values > 1 are treated as an absolute triangle target.
+   - None (default) skips decimation entirely.
+
 Notes:
-- View-ray orientation works best when your trajectory is reasonable (pose graph optimization helps).
-- If view rays are unavailable/mismatched, we fall back to Open3D's consistent tangent plane orientation.
+   - View-ray orientation works best when your trajectory is reasonable (pose graph optimization helps).
+   - If view rays are unavailable/mismatched, we fall back to Open3D's consistent tangent plane orientation.
 """
 
 import argparse
+import bisect
 import copy
 import logging
 import sys
@@ -40,7 +56,6 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation as R
 from tqdm import tqdm
 
-
 # ----------------------------
 # Logging
 # ----------------------------
@@ -48,7 +63,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
-
 
 # ----------------------------
 # ROS2 message helpers
@@ -81,7 +95,6 @@ def convert_ros_pc2_to_o3d(msg):
         if xdt not in POINTFIELD_TO_DTYPE or ydt not in POINTFIELD_TO_DTYPE or zdt not in POINTFIELD_TO_DTYPE:
             return None
 
-        # Require consistent dtype across xyz for a clean structured view
         if not (xdt == ydt == zdt):
             return None
 
@@ -94,14 +107,12 @@ def convert_ros_pc2_to_o3d(msg):
         if itemsize <= 0:
             return None
 
-        dtype = np.dtype(
-            {
-                "names": ["x", "y", "z"],
-                "formats": [npdt, npdt, npdt],
-                "offsets": [xoff, yoff, zoff],
-                "itemsize": itemsize,
-            }
-        )
+        dtype = np.dtype({
+            "names": ["x", "y", "z"],
+            "formats": [npdt, npdt, npdt],
+            "offsets": [xoff, yoff, zoff],
+            "itemsize": itemsize,
+        })
 
         arr = np.frombuffer(msg.data, dtype=dtype, count=npoints)
         pts = np.empty((npoints, 3), dtype=np.float64)
@@ -151,7 +162,6 @@ def convert_compressed_image(msg):
     """Convert ROS CompressedImage message to PIL Image."""
     try:
         from io import BytesIO
-
         img = Image.open(BytesIO(bytes(msg.data)))
         return img.convert("RGB")
     except Exception as e:
@@ -187,11 +197,21 @@ def get_odom_transform(odom_msg):
         return None
 
 
-def get_closest_timestamp(ts, ts_to_value: dict):
-    """Return closest timestamp key in dict to `ts`."""
-    if not ts_to_value:
+def get_closest_timestamp(ts, sorted_keys: list):
+    """
+    O(log N) closest-timestamp lookup.
+    sorted_keys must be a pre-sorted list of integer timestamps (nanoseconds).
+    Returns the closest timestamp or None if the list is empty.
+    """
+    if not sorted_keys:
         return None
-    return min(ts_to_value.keys(), key=lambda k: abs(k - ts))
+    idx = bisect.bisect_left(sorted_keys, ts)
+    if idx == 0:
+        return sorted_keys[0]
+    if idx == len(sorted_keys):
+        return sorted_keys[-1]
+    before, after = sorted_keys[idx - 1], sorted_keys[idx]
+    return before if (ts - before) <= (after - ts) else after
 
 
 # ----------------------------
@@ -223,7 +243,8 @@ def ransac_coarse_alignment(source, target, source_fpfh, target_fpfh, voxel_size
         target_fpfh,
         mutual_filter=False,
         max_correspondence_distance=distance_threshold,
-        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+        # PointToPoint for coarse: no normal dependency, prevents accidental mutation of stored clouds
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(),
         ransac_n=4,
         checkers=[
             o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
@@ -283,18 +304,23 @@ def detect_loop_closure(
         if cand_fpfh is None:
             continue
 
-        coarse = ransac_coarse_alignment(current_pcd, historical_pcds[cand_idx], current_fpfh, cand_fpfh, voxel_size)
+        # Deepcopy to prevent mutating shared state in the history buffer
+        cand_pcd = copy.deepcopy(historical_pcds[cand_idx])
+
+        coarse = ransac_coarse_alignment(current_pcd, cand_pcd, current_fpfh, cand_fpfh, voxel_size)
         if coarse is None:
             continue
 
+        # ICP refine — keep PointToPlane here where normals matter
         icp = o3d.pipelines.registration.registration_icp(
             current_pcd,
-            historical_pcds[cand_idx],
+            cand_pcd,
             voxel_size * 2.0,
             coarse,
             o3d.pipelines.registration.TransformationEstimationPointToPlane(),
             o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=20),
         )
+
         if float(icp.fitness) >= float(loop_fitness_thresh):
             loop_closures.append((cand_idx, icp.transformation, float(icp.fitness)))
 
@@ -312,7 +338,7 @@ def _safe_normalize(v: np.ndarray, eps: float = 1e-12) -> np.ndarray:
 def attach_view_rays_as_normals(pcd_world: o3d.geometry.PointCloud, sensor_origin_world: np.ndarray) -> None:
     """
     Compute unit viewing rays (sensor_origin_world - point_world) and store them in pcd_world.normals.
-    This should be called BEFORE voxel downsampling so the downsampler averages rays per voxel.
+    Call BEFORE voxel downsampling so the downsampler averages rays per voxel.
     """
     pts = np.asarray(pcd_world.points, dtype=np.float64)
     if pts.shape[0] == 0:
@@ -323,9 +349,7 @@ def attach_view_rays_as_normals(pcd_world: o3d.geometry.PointCloud, sensor_origi
 
 
 def orient_geometric_normals_with_view_rays(pcd: o3d.geometry.PointCloud, view_rays: np.ndarray) -> None:
-    """
-    Given pcd with estimated geometric normals, flip any normal that points away from view_rays.
-    """
+    """Flip any geometric normal that points away from the stored view rays."""
     geom = np.asarray(pcd.normals, dtype=np.float64)
     if geom.shape[0] == 0:
         return
@@ -348,9 +372,7 @@ def estimate_geometric_normals_oriented(
     voxel_size: float,
     view_rays: np.ndarray | None,
 ) -> None:
-    """
-    Estimate geometric normals and orient them using view rays when available.
-    """
+    """Estimate geometric normals and orient them using view rays when available."""
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 3.0, max_nn=30)
     )
@@ -359,7 +381,6 @@ def estimate_geometric_normals_oriented(
     if view_rays is not None and view_rays.shape[0] == len(pcd.points):
         orient_geometric_normals_with_view_rays(pcd, view_rays)
     else:
-        # fallback: Open3D's consistency heuristic
         try:
             pcd.orient_normals_consistent_tangent_plane(100)
         except Exception:
@@ -437,7 +458,7 @@ def clean_point_cloud(
 # ----------------------------
 # Color projection + merging
 # ----------------------------
-def color_point_cloud_from_image(pcd: o3d.geometry.PointCloud, img: Image.Image, camera_pose: np.ndarray, intrinsics: dict):
+def color_point_cloud_from_image(pcd: o3d.geometry.PointCloud, img: Image.Image, camera_pose: np.ndarray, intrinsics: dict, color_min_depth: float = 0.1, color_max_depth: float | None = None):
     """
     Project camera image colors onto point cloud.
     Assumes camera is co-located with the point cloud sensor unless you apply an extrinsic transform yourself.
@@ -457,18 +478,28 @@ def color_point_cloud_from_image(pcd: o3d.geometry.PointCloud, img: Image.Image,
 
     rel = pts - cam_p
     cam = cam_R.inv().apply(rel)
-
-    # ROS body -> optical approximation used in your original script: (-y, -z, x)
+    # ROS body -> optical approximation: (-y, -z, x)
     opt = np.column_stack((-cam[:, 1], -cam[:, 2], cam[:, 0]))
     z = opt[:, 2]
-    valid = z > 0.1
 
-    u = fx * (opt[:, 0] / z) + cx
-    v = fy * (opt[:, 1] / z) + cy
+    # Use Euclidean depth rather than just Z axis
+    depth = np.linalg.norm(cam, axis=1)
+
+    # Avoid zero division for projection math
+    z_safe = np.where(z > 1e-6, z, 1e-6)
+
+    valid = depth > color_min_depth
+    if color_max_depth is not None:
+        valid &= (depth < color_max_depth)
+
+    valid &= (z > 1e-6) # Strictly in front of camera
+
+    u = fx * (opt[:, 0] / z_safe) + cx
+    v = fy * (opt[:, 1] / z_safe) + cy
 
     valid &= (u >= 0) & (u < w) & (v >= 0) & (v < h)
 
-    colors = np.full((len(pts), 3), 0.5, dtype=np.float64)  # default gray
+    colors = np.full((len(pts), 3), 0.5, dtype=np.float64)
     if np.any(valid):
         ui = np.clip(u[valid].astype(int), 0, w - 1)
         vi = np.clip(v[valid].astype(int), 0, h - 1)
@@ -513,7 +544,6 @@ def merge_colored_point_clouds(colored_pcds, voxel_size: float = 0.02, gray_filt
         all_cols.append(cols)
         all_is_gray.append(is_gray)
 
-        # Preserve normals if present; if missing, fill zeros so indexing stays consistent
         if nors is None:
             nors = np.zeros((pts.shape[0], 3), dtype=np.float64)
         all_nors.append(nors)
@@ -553,12 +583,10 @@ def merge_colored_point_clouds(colored_pcds, voxel_size: float = 0.02, gray_filt
     merged.points = o3d.utility.Vector3dVector(merged_pts)
     merged.colors = o3d.utility.Vector3dVector(merged_cols)
 
-    # Only attach normals if there were real normals in inputs (non-zero)
     if np.any(np.linalg.norm(merged_nors, axis=1) > 0):
         merged.normals = o3d.utility.Vector3dVector(_safe_normalize(merged_nors, eps=1e-12))
 
     logging.info(f"Fast voxel downsampling (voxel_size={voxel_size})...")
-    # Native Open3D C++ downsampling (takes < 1 second instead of 10+ minutes)
     down = merged.voxel_down_sample(voxel_size)
     return down
 
@@ -572,10 +600,11 @@ def create_colored_mesh(
     min_density_percentile: float = 1.0,
     max_vertex_distance: float = 0.15,
     workers: int = 4,
+    decimate_target: float | None = None,
 ):
     """
-    Poisson reconstruction + trimming.
-    Expects pcd to already have good normals (we estimate+orient them in the main pipeline).
+    Poisson reconstruction + trimming + optional decimation.
+    Expects pcd to already have good normals (estimated+oriented in the main pipeline).
     """
     logging.info(f"Input point cloud: {len(pcd.points)} points")
 
@@ -601,11 +630,16 @@ def create_colored_mesh(
         thr = np.percentile(densities, float(min_density_percentile))
         logging.info(f"Density trim: bottom {min_density_percentile}% (threshold={thr:.4f})")
 
-        # It is crucial to convert densities mask to a clean boolean numpy array
         density_mask = np.asarray(densities < thr, dtype=bool)
         mesh.remove_vertices_by_mask(density_mask)
 
-    # Re-fetch points after potential mutations
+    # Guard: fail loudly rather than silently writing an empty mesh
+    if len(mesh.triangles) == 0:
+        raise ValueError(
+            "Mesh is empty after density trim. "
+            "Try a lower --min_density_percentile or smaller --voxel_size."
+        )
+
     p = np.asarray(pcd.points)
     v = np.asarray(mesh.vertices)
 
@@ -614,50 +648,44 @@ def create_colored_mesh(
         tree = cKDTree(p)
 
         logging.info(f"Querying {len(v)} vertices against {len(p)} points...")
-        # Use parallel workers to speed up the distance and index query
         d, idx = tree.query(v, k=1, workers=workers)
         logging.info("Spatial query complete.")
 
         if max_vertex_distance and float(max_vertex_distance) > 0:
-            logging.info(f"Distance trim: calculating boolean mask for vertices farther than {max_vertex_distance}m...")
+            logging.info(f"Distance trim: removing vertices farther than {max_vertex_distance}m...")
 
             remove_mask = d > float(max_vertex_distance)
-            logging.info(f"Distance trim: removing {np.sum(remove_mask)} vertices out of {len(remove_mask)}...")
+            logging.info(f"Distance trim: removing {np.sum(remove_mask)} of {len(remove_mask)} vertices...")
 
-            # Ensure bool array is properly cast and contiguous
             remove_mask_bool = np.asarray(remove_mask, dtype=bool).copy()
             mesh.remove_vertices_by_mask(remove_mask_bool)
-
             logging.info("Distance trim: mask applied successfully.")
 
-            # Filter the queried indices to only the surviving vertices
             valid_mask = ~remove_mask_bool
             idx = idx[valid_mask]
 
-        # Delaying color mapping until the mesh is fully cleaned up and reduced...
-
-    # Cleanup
+    # ------- Cleanup sequence -------
     logging.info("Starting mesh cleanup sequence...")
-    logging.info("  1/6: Removing duplicated vertices...")
-    mesh.remove_duplicated_vertices()     # 1. merge coincident vertices first
+    logging.info(" 1/6: Removing duplicated vertices...")
+    mesh.remove_duplicated_vertices()
 
-    logging.info("  2/6: Removing duplicated triangles...")
-    mesh.remove_duplicated_triangles()    # 2. now dedup triangles with merged indices
+    logging.info(" 2/6: Removing duplicated triangles...")
+    mesh.remove_duplicated_triangles()
 
-    logging.info("  3/6: Removing degenerate triangles...")
-    mesh.remove_degenerate_triangles()    # 3. catch any zero-area triangles created above
+    logging.info(" 3/6: Removing degenerate triangles...")
+    mesh.remove_degenerate_triangles()
 
-    logging.info("  4/6: Removing non-manifold edges...")
-    mesh.remove_non_manifold_edges()      # 4. remove fan edges after topology is clean
+    logging.info(" 4/6: Removing non-manifold edges...")
+    mesh.remove_non_manifold_edges()
 
-    logging.info("  5/6: Removing degenerate triangles (second pass)...")
-    mesh.remove_degenerate_triangles()    # 5. second pass — non-manifold removal can expose new ones
+    logging.info(" 5/6: Removing degenerate triangles (second pass)...")
+    mesh.remove_degenerate_triangles()
 
-    logging.info("  6/6: Removing unreferenced vertices...")
-    mesh.remove_unreferenced_vertices()   # 6. always last
+    logging.info(" 6/6: Removing unreferenced vertices...")
+    mesh.remove_unreferenced_vertices()
     logging.info("Mesh cleanup sequence complete.")
 
-    # Extract largest connected component to ensure structural connectivity for navigation
+    # Extract largest connected component
     logging.info("Extracting largest connected component...")
     triangle_clusters, cluster_n_triangles, cluster_area = mesh.cluster_connected_triangles()
     triangle_clusters = np.asarray(triangle_clusters)
@@ -668,39 +696,52 @@ def create_colored_mesh(
         mesh.remove_triangles_by_mask(triangles_to_remove)
         mesh.remove_unreferenced_vertices()
 
-        # Iteratively clean up non-manifold geometry and topological mess
-        print("Cleaning non-manifold geometry iteratively...")
-        max_iters = 10
-        for i in range(max_iters):
-            # 1. Merge duplicates and degenerates first
-            mesh.remove_duplicated_vertices()
-            mesh.remove_duplicated_triangles()
-            mesh.remove_degenerate_triangles()
+    # Iterative non-manifold cleanup
+    logging.info("Cleaning non-manifold geometry iteratively...")
+    max_iters = 10
+    for i in range(max_iters):
+        mesh.remove_duplicated_vertices()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_degenerate_triangles()
 
-            # 2. Fix non-manifold edges
-            if not mesh.is_edge_manifold(allow_boundary_edges=True):
-                mesh.remove_non_manifold_edges()
+        if not mesh.is_edge_manifold(allow_boundary_edges=True):
+            mesh.remove_non_manifold_edges()
 
-            # 3. Fix non-manifold vertices
-            if not mesh.is_vertex_manifold():
-                nm_verts = mesh.get_non_manifold_vertices()
-                if len(nm_verts) > 0:
-                    mask = np.zeros(len(mesh.vertices), dtype=bool)
-                    mask[np.asarray(nm_verts)] = True
-                    mesh.remove_vertices_by_mask(mask)
+        if not mesh.is_vertex_manifold():
+            nm_verts = mesh.get_non_manifold_vertices()
+            if len(nm_verts) > 0:
+                mask = np.zeros(len(mesh.vertices), dtype=bool)
+                mask[np.asarray(nm_verts)] = True
+                mesh.remove_vertices_by_mask(mask)
 
-            # 4. Clean up any floating vertices left behind by the deletions
-            mesh.remove_unreferenced_vertices()
+        mesh.remove_unreferenced_vertices()
 
-            # 5. Break the loop if the mesh is completely clean
-            if mesh.is_edge_manifold(allow_boundary_edges=True) and mesh.is_vertex_manifold():
-                print(f"Topology cleaned successfully in {i+1} iterations.")
-                break
+        if mesh.is_edge_manifold(allow_boundary_edges=True) and mesh.is_vertex_manifold():
+            logging.info(f"Topology cleaned successfully in {i + 1} iterations.")
+            break
+    else:
+        logging.warning("Reached max iterations. Mesh might still have non-manifold geometry.")
+
+    # ------- Optional decimation (after manifold repair, before validation) -------
+    if decimate_target is not None:
+        n_before = len(mesh.triangles)
+        if decimate_target <= 1.0:
+            target_tris = max(1, int(n_before * decimate_target))
         else:
-            print("Warning: Reached max iterations. Mesh might still have non-manifold geometry.")
+            target_tris = int(decimate_target)
+        logging.info(f"Decimating mesh: {n_before} -> ~{target_tris} triangles...")
+        mesh = mesh.simplify_quadric_decimation(
+            target_number_of_triangles=target_tris,
+            boundary_weight=10.0,  # preserve border edges
+        )
+        # Re-run cleanup — decimation can re-expose degenerate geometry
+        mesh.remove_degenerate_triangles()
+        mesh.remove_duplicated_triangles()
+        mesh.remove_non_manifold_edges()
+        mesh.remove_unreferenced_vertices()
+        logging.info(f"Decimated mesh: {len(mesh.triangles)} triangles")
 
-
-    # Ensure vertex colors exist if pcd has colors
+    # ------- Color painting -------
     if pcd.has_colors() and not mesh.has_vertex_colors():
         logging.info("Painting colors onto the final, cleaned mesh structure...")
         p_final = np.asarray(pcd.points)
@@ -712,22 +753,15 @@ def create_colored_mesh(
             _, color_idx = tree_final.query(v_final, k=1, workers=workers)
             mesh.vertex_colors = o3d.utility.Vector3dVector(c_final[color_idx])
 
-    # Validation checks
+    # ------- Validation -------
     logging.info("Verifying mesh integrity...")
     is_edge_manifold = mesh.is_edge_manifold(allow_boundary_edges=True)
     is_vertex_manifold = mesh.is_vertex_manifold()
 
-    # logging.info("Testing for self-intersections (this may take a moment)...")
-    # has_self_intersections = mesh.is_self_intersecting()
-
-    logging.info(f"  - Edge Manifold: {is_edge_manifold}")
-    logging.info(f"  - Vertex Manifold: {is_vertex_manifold}")
-    # logging.info(f"  - Self-Intersecting: {has_self_intersections}")
-
-    # if has_self_intersections:
-        # logging.warning("Mesh has self-intersections. This can confuse collision detection systems.")
-
+    logging.info(f" - Edge Manifold: {is_edge_manifold}")
+    logging.info(f" - Vertex Manifold: {is_vertex_manifold}")
     logging.info(f"Final mesh: {len(mesh.vertices)} vertices, {len(mesh.triangles)} faces")
+
     return mesh
 
 
@@ -762,10 +796,10 @@ def process_bag(args):
         logging.info("Loop closure: disabled")
 
     # 1) Extract data
-    point_clouds = []        # [(ts, pcd)]
-    odom_data = {}           # ts -> 4x4
-    camera_images = {}       # ts -> PIL Image
-    camera_info_msgs = {}    # ts -> (fx, fy, cx, cy, w, h)
+    point_clouds = []       # [(ts, pcd)]
+    odom_data = {}          # ts -> 4x4
+    camera_images = {}      # ts -> PIL Image
+    camera_info_msgs = {}   # ts -> (fx, fy, cx, cy, w, h)
 
     topics_to_read = [pc_topic]
     if odom_topic:
@@ -802,38 +836,43 @@ def process_bag(args):
                         img = convert_ros_image(msg, enc)
                     if img is not None:
                         camera_images[ts] = img
-                        
+
                 elif camera_info_topic and conn.topic == camera_info_topic:
                     camera_info_msgs[ts] = intrinsics_from_camera_info(msg)
 
             except Exception:
                 continue
 
-    # Fill intrinsics from CameraInfo if not provided
+    # Warn if odom topic was specified but produced no messages
+    if odom_topic and len(odom_data) == 0:
+        logging.warning(
+            "Warning: Odometry topic specified but no messages found. "
+            "Falling back to identity initial guess for all frames."
+        )
+
+    # Fill intrinsics from CameraInfo if not provided via CLI
     if camera_topic:
         have_cli_intrinsics = all(v is not None for v in [args.camera_fx, args.camera_fy, args.camera_cx, args.camera_cy])
-        
+
         if not have_cli_intrinsics:
             if not camera_info_msgs:
                 sys.exit(
                     f"Error: camera intrinsics not provided and no CameraInfo messages found on '{camera_info_topic}'. "
                     "Provide --camera_fx/fy/cx/cy or set --camera_info_topic."
                 )
-            
-            # Intrinsics are usually constant; pick the earliest CameraInfo
+
             first_ts = min(camera_info_msgs.keys())
             fx, fy, cx, cy, w, h = camera_info_msgs[first_ts]
-            
+
             args.camera_fx = fx
             args.camera_fy = fy
             args.camera_cx = cx
             args.camera_cy = cy
             args.camera_width = args.camera_width or w
             args.camera_height = args.camera_height or h
-            
+
             logging.info(f"Loaded camera intrinsics from {camera_info_topic}: fx={fx:.1f}, fy={fy:.1f}, cx={cx:.1f}, cy={cy:.1f}")
         else:
-            # Optionally fill missing width/height
             if (args.camera_width is None or args.camera_height is None) and camera_info_msgs:
                 first_ts = min(camera_info_msgs.keys())
                 _, _, _, _, w, h = camera_info_msgs[first_ts]
@@ -849,6 +888,10 @@ def process_bag(args):
     if camera_topic:
         logging.info(f"Extracted {len(camera_images)} camera images")
 
+    # Build sorted lookup list once — O(log N) lookups thereafter
+    odom_ts_sorted = sorted(odom_data.keys())
+    odom_max_latency_ns = int(args.odom_max_latency * 1e9)
+
     # 2) Pairwise registration + pose graph
     pose_graph = o3d.pipelines.registration.PoseGraph()
     current_transform = np.eye(4, dtype=np.float64)
@@ -861,18 +904,17 @@ def process_bag(args):
         search_param=o3d.geometry.KDTreeSearchParamHybrid(radius=args.voxel_size * 2.0, max_nn=30)
     )
 
-    src_fpfh = None
-    if args.enable_loop_closure and (0 % args.loop_closure_search_interval == 0):
+    # Only allocate loop closure bookkeeping when the feature is enabled
+    if args.enable_loop_closure:
         src_fpfh = compute_fpfh_descriptor(src, args.voxel_size)
-
-    accumulated_pcds = [src]
-    accumulated_fpfhs = [src_fpfh]
-    accumulated_poses = [current_transform.copy()]
+        accumulated_pcds = [src]
+        accumulated_fpfhs = [src_fpfh]
+        accumulated_poses = [current_transform.copy()]
 
     previous_odom_T = None
-    if odom_topic:
-        closest_ts = get_closest_timestamp(_ts0, odom_data)
-        if closest_ts is not None:
+    if odom_topic and odom_ts_sorted:
+        closest_ts = get_closest_timestamp(_ts0, odom_ts_sorted)
+        if closest_ts is not None and abs(closest_ts - _ts0) < odom_max_latency_ns:
             previous_odom_T = odom_data[closest_ts]
 
     successful_pc_indices = [0]
@@ -887,13 +929,17 @@ def process_bag(args):
         )
 
         initial_guess = np.eye(4, dtype=np.float64)
-        if odom_topic:
-            closest_ts = get_closest_timestamp(ts, odom_data)
-            if closest_ts is not None:
+        if odom_topic and odom_ts_sorted:
+            closest_ts = get_closest_timestamp(ts, odom_ts_sorted)
+            if closest_ts is not None and abs(closest_ts - ts) < odom_max_latency_ns:
                 current_odom_T = odom_data[closest_ts]
                 if previous_odom_T is not None:
                     initial_guess = np.linalg.inv(previous_odom_T) @ current_odom_T
                 previous_odom_T = current_odom_T
+            else:
+                # Stale match — reset chain and fall back to identity
+                previous_odom_T = None
+                initial_guess = np.eye(4)
 
         try:
             reg = o3d.pipelines.registration.registration_icp(
@@ -912,7 +958,7 @@ def process_bag(args):
 
         current_transform = reg.transformation @ current_transform
 
-        # PoseGraphNode stores the inverse pose (Open3D convention in many examples)
+        # PoseGraphNode stores the inverse pose (Open3D convention)
         pose_graph.nodes.append(o3d.pipelines.registration.PoseGraphNode(np.linalg.inv(current_transform)))
 
         info = np.eye(6, dtype=np.float64) * max(float(reg.fitness), 1e-6)
@@ -926,40 +972,42 @@ def process_bag(args):
             )
         )
 
-        accumulated_pcds.append(tgt)
-        accumulated_poses.append(current_transform.copy())
+        if args.enable_loop_closure:
+            accumulated_pcds.append(tgt)
+            accumulated_poses.append(current_transform.copy())
 
-        do_lc = args.enable_loop_closure and (i % args.loop_closure_search_interval == 0)
-        tgt_fpfh = None
-        if do_lc:
-            tgt_fpfh = compute_fpfh_descriptor(tgt, args.voxel_size)
-        accumulated_fpfhs.append(tgt_fpfh)
+            do_lc = (i % args.loop_closure_search_interval == 0)
+            tgt_fpfh = None
+            if do_lc:
+                tgt_fpfh = compute_fpfh_descriptor(tgt, args.voxel_size)
+            accumulated_fpfhs.append(tgt_fpfh)
 
-        if do_lc:
-            lcs = detect_loop_closure(
-                current_idx=len(accumulated_pcds) - 1,
-                current_pcd=tgt,
-                current_fpfh=tgt_fpfh,
-                historical_pcds=accumulated_pcds,
-                historical_fpfhs=accumulated_fpfhs,
-                historical_poses=accumulated_poses,
-                voxel_size=args.voxel_size,
-                search_radius=args.loop_closure_radius,
-                loop_fitness_thresh=args.loop_closure_fitness_thresh,
-                temporal_window=100,
-            )
-            for cand_idx, lc_T, lc_fit in lcs:
-                lc_info = np.eye(6, dtype=np.float64) * (max(float(lc_fit), 1e-6) * 100.0)
-                pose_graph.edges.append(
-                    o3d.pipelines.registration.PoseGraphEdge(
-                        cand_idx,
-                        len(pose_graph.nodes) - 1,
-                        lc_T,
-                        lc_info,
-                        uncertain=True,
-                    )
+            if do_lc:
+                lcs = detect_loop_closure(
+                    current_idx=len(accumulated_pcds) - 1,
+                    current_pcd=tgt,
+                    current_fpfh=tgt_fpfh,
+                    historical_pcds=accumulated_pcds,
+                    historical_fpfhs=accumulated_fpfhs,
+                    historical_poses=accumulated_poses,
+                    voxel_size=args.voxel_size,
+                    search_radius=args.loop_closure_radius,
+                    loop_fitness_thresh=args.loop_closure_fitness_thresh,
+                    temporal_window=100,
                 )
-                loop_closures_found += 1
+
+                for cand_idx, lc_T, lc_fit in lcs:
+                    lc_info = np.eye(6, dtype=np.float64) * (max(float(lc_fit), 1e-6) * 100.0)
+                    pose_graph.edges.append(
+                        o3d.pipelines.registration.PoseGraphEdge(
+                            cand_idx,
+                            len(pose_graph.nodes) - 1,
+                            lc_T,
+                            lc_info,
+                            uncertain=True,
+                        )
+                    )
+                    loop_closures_found += 1
 
         successful_pc_indices.append(i)
         src = tgt
@@ -977,6 +1025,7 @@ def process_bag(args):
         edge_prune_threshold=0.25,
         reference_node=0,
     )
+
     try:
         o3d.pipelines.registration.global_optimization(
             pose_graph,
@@ -987,7 +1036,6 @@ def process_bag(args):
     except Exception as e:
         logging.warning(f"Warning: Global optimization failed: {e}")
 
-    # Helper: get pose used for transforming raw clouds (this matches your original usage)
     def node_pose(node_idx: int) -> np.ndarray:
         return np.asarray(pose_graph.nodes[node_idx].pose, dtype=np.float64)
 
@@ -1006,6 +1054,8 @@ def process_bag(args):
             "width": int(args.camera_width),
             "height": int(args.camera_height),
         }
+
+        # Pre-sort camera timestamps once for O(log N) lookups in the coloring loop
         cam_ts_sorted = sorted(camera_images.keys())
 
         for node_idx, pc_idx in tqdm(
@@ -1019,18 +1069,23 @@ def process_bag(args):
             pcd_world = copy.deepcopy(pc_raw)
             pcd_world.transform(T)
 
-            # Attach view rays (stored as normals) BEFORE any downsampling
             sensor_origin = T[:3, 3].copy()
             attach_view_rays_as_normals(pcd_world, sensor_origin)
 
-            # Find closest camera frame
-            closest_cam_ts = min(cam_ts_sorted, key=lambda t: abs(t - pc_ts))
+            # O(log N) camera timestamp lookup
+            closest_cam_ts = get_closest_timestamp(pc_ts, cam_ts_sorted)
             time_diff_s = abs(closest_cam_ts - pc_ts) / 1e9
             if time_diff_s <= float(args.max_time_diff):
                 img = camera_images[closest_cam_ts]
-                pcd_world = color_point_cloud_from_image(pcd_world, img, T, intrinsics)
+                pcd_world = color_point_cloud_from_image(
+                    pcd_world, 
+                    img, 
+                    T, 
+                    intrinsics,
+                    color_min_depth=float(args.color_min_depth),
+                    color_max_depth=float(args.color_max_depth) if args.color_max_depth is not None else None
+                )
             else:
-                # no close image -> gray
                 pcd_world.colors = o3d.utility.Vector3dVector(
                     np.full((len(pcd_world.points), 3), 0.5, dtype=np.float64)
                 )
@@ -1044,7 +1099,6 @@ def process_bag(args):
             gray_filter_radius=float(args.gray_filter_radius),
         )
 
-        # Clean (ROR/SOR/DBSCAN) WITHOUT another voxel stage (already downsampled by merge)
         cleaned = clean_point_cloud(merged, float(args.voxel_size), do_voxel_downsample=False)
 
     else:
@@ -1070,7 +1124,7 @@ def process_bag(args):
         if len(pcd_combined.points) == 0:
             sys.exit("Error: Combined point cloud is empty.")
 
-        # Optional floor leveling (apply rotation to both points AND view-ray normals)
+        # Optional floor leveling
         if args.level_floor:
             logging.info("Attempting to level the floor...")
             try:
@@ -1080,6 +1134,7 @@ def process_bag(args):
                     ransac_n=3,
                     num_iterations=1000,
                 )
+
                 a, b, c, _d = plane_model
                 n = np.array([a, b, c], dtype=np.float64)
                 n = n / (np.linalg.norm(n) + 1e-12)
@@ -1118,7 +1173,7 @@ def process_bag(args):
 
         cleaned = clean_point_cloud(pcd_combined, float(args.voxel_size), do_voxel_downsample=True)
 
-    # Save point cloud (keep view rays in normals for debugging/orientation traceability)
+    # Save point cloud
     ply_path = out_dir / f"{bag_path.stem}_cloud.ply"
     o3d.io.write_point_cloud(str(ply_path), cleaned)
     logging.info(f"Saved point cloud: {ply_path}")
@@ -1128,7 +1183,6 @@ def process_bag(args):
     if cleaned.has_normals():
         view_rays = np.asarray(cleaned.normals, dtype=np.float64).copy()
 
-    # Estimate + orient geometric normals for Poisson
     logging.info("Estimating geometric normals for meshing (and orienting with view rays when available)...")
     estimate_geometric_normals_oriented(cleaned, float(args.voxel_size), view_rays)
 
@@ -1139,6 +1193,7 @@ def process_bag(args):
         min_density_percentile=float(args.min_density_percentile),
         max_vertex_distance=float(args.max_vertex_distance),
         workers=args.workers,
+        decimate_target=args.decimate_target,
     )
 
     mesh_ply_path = out_dir / f"{bag_path.stem}_mesh.ply"
@@ -1155,7 +1210,7 @@ def main():
     p.add_argument("bagpath", help="Path to the ROS 2 bag file.")
     p.add_argument("outputdir", help="Directory to save outputs.")
 
-    # Topic args (add aliases so older README/usage still works)
+    # Topic args (aliases preserve backward compatibility)
     p.add_argument("--pctopic", "--pc_topic", dest="pc_topic", default="points", help="PointCloud2 topic name.")
     p.add_argument("--cameratopic", "--camera_topic", dest="camera_topic", default=None, help="Camera topic (Image or CompressedImage).")
     p.add_argument("--camerainfotopic", "--camera_info_topic", dest="camera_info_topic", default=None, help="CameraInfo topic (sensor_msgs/CameraInfo).")
@@ -1175,6 +1230,11 @@ def main():
     p.add_argument("--icpdistthresh", "--icp_dist_thresh", dest="icp_dist_thresh", type=float, default=0.2, help="ICP max correspondence distance (meters).")
     p.add_argument("--icpfitnessthresh", "--icp_fitness_thresh", dest="icp_fitness_thresh", type=float, default=0.6, help="Min ICP fitness to accept a frame.")
 
+    # Odometry staleness guard
+    p.add_argument("--odom_max_latency", dest="odom_max_latency", type=float, default=0.5,
+                   help="Max allowed age of an odometry match in seconds (default: 0.5). "
+                        "Matches older than this are rejected and ICP falls back to identity.")
+
     # Loop closure
     p.add_argument("--enableloopclosure", "--enable_loop_closure", dest="enable_loop_closure", action="store_true", default=False, help="Enable loop closure.")
     p.add_argument("--loopclosureradius", "--loop_closure_radius", dest="loop_closure_radius", type=float, default=10.0, help="Loop closure search radius (m).")
@@ -1183,19 +1243,25 @@ def main():
 
     # Color merge params
     p.add_argument("--grayfilterradius", "--gray_filter_radius", dest="gray_filter_radius", type=float, default=0.05, help="Remove gray points within this distance of colored points (m).")
+    p.add_argument("--colormindepth", "--color_min_depth", dest="color_min_depth", type=float, default=0.1, help="Min Euclidean distance (m) for color projection. Points closer than this get gray fill. (default: 0.1)")
+    p.add_argument("--colormaxdepth", "--color_max_depth", dest="color_max_depth", type=float, default=None, help="Max Euclidean distance (m) for color projection. Points beyond this get gray fill. (default: None)")
 
     # Mesh params
-    p.add_argument("--poissondepth", "--poisson_depth", dest="poisson_depth", type=int, default=9, help="Poisson depth.")
-    p.add_argument("--mindensitypercentile", "--min_density_percentile", dest="min_density_percentile", type=float, default=1.0, help="Trim bottom density percentile.")
+    p.add_argument("--poissondepth", "--poisson_depth", dest="poisson_depth", type=int, default=9, help="Poisson reconstruction depth.")
+    p.add_argument("--mindensitypercentile", "--min_density_percentile", dest="min_density_percentile", type=float, default=1.0, help="Trim bottom density percentile after Poisson reconstruction.")
     p.add_argument("--maxvertexdistance", "--max_vertex_distance", dest="max_vertex_distance", type=float, default=0.15, help="Trim mesh vertices farther than this from points (m).")
+    p.add_argument("--decimate_target", dest="decimate_target", type=float, default=None,
+                   help="Mesh decimation target. Values <= 1.0 are treated as a ratio of the current "
+                        "triangle count (e.g. 0.25 = reduce to 25%%). Values > 1 are an absolute triangle "
+                        "count. Omit (default) to skip decimation entirely.")
 
     # Other
-        # Other
     p.add_argument("--levelfloor", "--level_floor", dest="level_floor", action="store_true", help="Attempt floor leveling.")
     p.add_argument("--workers", type=int, default=4, help="Number of threads/workers.")
 
     args = p.parse_args()
     process_bag(args)
+
 
 if __name__ == "__main__":
     main()
