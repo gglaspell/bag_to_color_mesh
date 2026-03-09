@@ -300,6 +300,8 @@ docker run --rm \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--gray_filter_radius` | `0.05` | Remove gray points within distance (m) of color points |
+| `--color_min_depth` | `0.1` | Min Euclidean distance (m) for coloring. Closer points get gray fill. |
+| `--color_max_depth` | `None` | Max Euclidean distance (m) for coloring. Farther points get gray fill. |
 
 ### Mesh Generation Parameters
 
