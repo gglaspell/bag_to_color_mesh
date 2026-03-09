@@ -261,14 +261,15 @@ docker run --rm \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--camera_topic` | `None` | Camera topic (Image or CompressedImage) |
-| `--camera_info_topic` | `None` | Camera info topic |
+| `--camera_info_topic` | None | Camera infor topic |
 | `--camera_fx` | `None` | Focal length x (pixels) |
 | `--camera_fy` | `None` | Focal length y (pixels) |
 | `--camera_cx` | `None` | Principal point x (pixels) |
 | `--camera_cy` | `None` | Principal point y (pixels) |
-| `--camera_width` | `None` | Image width (pixels) |
-| `--camera_height` | `None` | Image height (pixels) |
+| `--camera_width` | `640` | Image width (pixels) |
+| `--camera_height` | `480` | Image height (pixels) |
 | `--max_time_diff` | `0.1` | Max time diff (sec) for camera/lidar sync |
+| `--odom_max_latency` | `0.5`     | Max allowed age (sec) of an odometry match. Stale matches reset the chain and fall back to identity. |
 
 ### Point Cloud & Odometry Parameters
 
@@ -307,12 +308,14 @@ docker run --rm \
 | `--poisson_depth` | `9` | Poisson octree depth (higher = more detail) |
 | `--min_density_percentile` | `1.0` | Filter vertices below this density percentile |
 | `--max_vertex_distance` | `0.15` | Max distance (m) from mesh vertex to point |
+| `--decimate_target` | `None`    | ≤ 1.0 = ratio of triangles (e.g. 0.25 = 25%); > 1 = absolute count; omit to skip |
 
 ### Other Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--level_floor` | `False` | Apply post-processing Z-leveling |
+| `--workers` | `4`       | Parallel worker threads for spatial queries and color painting |
 
 ---
 
@@ -338,6 +341,9 @@ Check your camera's calibration YAML file (usually in `~/.ros/camera_info/`):
 camera_matrix:
   data: [fx, 0, cx, 0, fy, cy, 0, 0, 1]
 ```
+
+Tuning `--poisson_depth`: Values 8–9 suit most outdoor scenes at --voxel_size 0.05. Push to 10–11 for fine indoor detail at the cost of ~4× more memory per level. Drop to 7 for fast previews.
+
 
 ### Finding Your Topics
 
